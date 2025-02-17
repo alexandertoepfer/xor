@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <windows.h>
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
 
@@ -42,6 +43,29 @@ struct HexDecoded {
     }
     operator std::string() const { return value; }
 };
+
+void ClearConsoleBuffer() {
+    // Get handle to standard output
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hConsole == INVALID_HANDLE_VALUE)
+        return;
+
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (!GetConsoleScreenBufferInfo(hConsole, &csbi))
+        return;
+
+    // Calculate total number of character cells in the buffer
+    DWORD consoleSize = csbi.dwSize.X * csbi.dwSize.Y;
+    COORD topLeft = { 0, 0 };
+    DWORD charsWritten;
+
+    // Overwrite entire buffer with spaces
+    FillConsoleOutputCharacter(hConsole, ' ', consoleSize, topLeft, &charsWritten);
+    // Reset attributes (colors, etc.) to the current default
+    FillConsoleOutputAttribute(hConsole, csbi.wAttributes, consoleSize, topLeft, &charsWritten);
+    // Move the cursor to the top-left corner
+    SetConsoleCursorPosition(hConsole, topLeft);
+}
 
 std::string generateRandomBytes(size_t length) {
     std::random_device rd;
@@ -169,5 +193,6 @@ int main() {
         processedStrings.emplace_back(clear);
     }
     std::cin.get();
+    ClearConsoleBuffer();
     return 0;
 }
