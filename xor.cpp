@@ -87,9 +87,9 @@ std::string sha256(const std::string& input) {
 // Derive a key of the given length using PBKDF2.
 std::string pbkdf2(const std::string& password, const std::string& salt, size_t keyLength, int iterations) {
     std::vector<unsigned char> key(keyLength);
-    PKCS5_PBKDF2_HMAC(password.c_str(), password.size(),
-        reinterpret_cast<const unsigned char*>(salt.data()), salt.size(),
-        iterations, EVP_sha256(), keyLength, key.data());
+    PKCS5_PBKDF2_HMAC(password.c_str(), static_cast<int>(password.size()),
+        reinterpret_cast<const unsigned char*>(salt.data()), static_cast<int>(salt.size()),
+        iterations, EVP_sha256(), static_cast<int>(keyLength), key.data());
     return std::string(reinterpret_cast<char*>(key.data()), keyLength);
 }
 
@@ -112,7 +112,41 @@ std::string hmacSha256(const std::string& key, const std::string& message) {
     return std::string(reinterpret_cast<char*>(mac.data()), macLength);
 }
 
+/// HKDF-like expansion function.
+/// Using our master key (acting as the pseudorandom key), we generate a long output (okm)
+/// by iteratively applying HMAC. Note that this is a simplified version.
+std::string hkdfExpand(const std::string& prk, const std::string& info, size_t length) {
+    size_t hashLen = SHA256_DIGEST_LENGTH; // 32 bytes for SHA-256
+    size_t N = (length + hashLen - 1) / hashLen;
+    std::string T;
+    std::string okm;
+    for (size_t i = 1; i <= N; i++) {
+        // T(n) = HMAC(prk, T(n-1) || info || i)
+        std::string data = T + info + std::string(1, static_cast<char>(i));
+        T = hmacSha256(prk, data);
+        okm += T;
+    }
+    okm.resize(length);
+    return okm;
+}
+
+/// Expand the master key into a vector of round keys.
+std::vector<std::string> expandRoundKeys(const std::string& masterKey, int rounds, size_t roundKeyLen = SHA256_DIGEST_LENGTH) {
+    const std::string info = "FeistelRoundKey"; // arbitrary context string
+    std::vector<std::string> roundKeys;
+    // Expand into rounds * roundKeyLen bytes, then slice.
+    std::string okm = hkdfExpand(masterKey, info, rounds * roundKeyLen);
+    for (int i = 0; i < rounds; i++) {
+        roundKeys.push_back(okm.substr(i * roundKeyLen, roundKeyLen));
+    }
+    return roundKeys;
+}
+
+/// Updated Feistel process that uses the expanded round keys.
 std::string feistelProcess(const std::string& input, const std::string& key, bool decrypt = false) {
+    // Expand the encryption key into FEISTEL_ROUNDS round keys.
+    std::vector<std::string> roundKeys = expandRoundKeys(key, FEISTEL_ROUNDS, SHA256_DIGEST_LENGTH);
+
     // Split the input into two halves.
     size_t halfSize = input.size() / 2;
     std::string L = input.substr(0, halfSize);
@@ -122,19 +156,17 @@ std::string feistelProcess(const std::string& input, const std::string& key, boo
     if (!decrypt) {
         // Encryption: apply rounds in forward order.
         for (int i = 0; i < rounds; i++) {
-            // Generate a round-specific key.
-            std::string roundKey = hmacSha256(key, std::to_string(i));
-            // Compute the round function F(R, roundKey).
-            std::string f = hmacSha256(roundKey, R);
+            // Use the precomputed round key.
+            std::string f = hmacSha256(roundKeys[i], R);
             // Ensure f is exactly as long as L.
             f.resize(L.size(), '\0');
 
-            // Compute newR = L XOR F(R, roundKey).
+            // newR = L XOR f.
             std::string newR(L.size(), '\0');
             for (size_t j = 0; j < L.size(); j++) {
                 newR[j] = L[j] ^ f[j];
             }
-            // Update the halves.
+            // Update halves.
             L = R;
             R = newR;
         }
@@ -142,14 +174,12 @@ std::string feistelProcess(const std::string& input, const std::string& key, boo
     else {
         // Decryption: apply rounds in reverse order.
         for (int i = rounds - 1; i >= 0; i--) {
-            // Generate the same round-specific key.
-            std::string roundKey = hmacSha256(key, std::to_string(i));
             // In decryption the round function is computed from L.
-            std::string f = hmacSha256(roundKey, L);
+            std::string f = hmacSha256(roundKeys[i], L);
             // Ensure f is exactly as long as R.
             f.resize(R.size(), '\0');
 
-            // Compute original L = R XOR F(L, roundKey).
+            // original L = R XOR f.
             std::string newL(R.size(), '\0');
             for (size_t j = 0; j < R.size(); j++) {
                 newL[j] = R[j] ^ f[j];
@@ -161,8 +191,6 @@ std::string feistelProcess(const std::string& input, const std::string& key, boo
     }
     return L + R;
 }
-
-
 
 bool secureCompare(const std::string& a, const std::string& b) {
     return (a.size() == b.size()) && (std::memcmp(a.data(), b.data(), a.size()) == 0);
@@ -191,7 +219,7 @@ int main() {
                 std::string rawText = input.substr(3);
                 std::string salt = generateRandomBytes(SALT_SIZE);
 
-                // Derive subkeys
+                // Derive subkeys.
                 auto [encryptionKey, macKey] = deriveSubkeys(password, salt);
 
                 // Compute MAC for the plaintext using macKey.
@@ -204,7 +232,7 @@ int main() {
                 processedStrings.emplace_back(HexEncoded{ salt + encrypted });
             }
             else {
-                // Otherwise, we assume the input is hex-encoded ciphertext.
+                // Otherwise, assume the input is hex-encoded ciphertext.
                 std::string decoded = HexDecoded{ input };
                 if (decoded.size() < SALT_SIZE) {
                     processedStrings.emplace_back("Invalid input format");
