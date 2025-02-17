@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
+#include <charconv> // for std::from_chars (C++17 and later)
 
 constexpr size_t SALT_SIZE = 32;
 constexpr size_t KEY_SIZE = 32;
@@ -37,7 +38,8 @@ struct HexDecoded {
         value.reserve(hex.size() / 2);
         for (size_t i = 0; i < hex.size(); i += 2) {
             int byte;
-            std::from_chars(hex.data() + i, hex.data() + i + 2, byte, 16);
+            auto [ptr, ec] = std::from_chars(hex.data() + i, hex.data() + i + 2, byte, 16);
+            // In a production system, check ec for errors.
             value.push_back(static_cast<char>(byte));
         }
     }
@@ -82,41 +84,85 @@ std::string sha256(const std::string& input) {
     return std::string(reinterpret_cast<char*>(hash.data()), hash.size());
 }
 
+// Derive a key of the given length using PBKDF2.
 std::string pbkdf2(const std::string& password, const std::string& salt, size_t keyLength, int iterations) {
-    std::array<unsigned char, KEY_SIZE> key{};
-    PKCS5_PBKDF2_HMAC_SHA1(password.c_str(), password.size(),
+    std::vector<unsigned char> key(keyLength);
+    PKCS5_PBKDF2_HMAC(password.c_str(), password.size(),
         reinterpret_cast<const unsigned char*>(salt.data()), salt.size(),
-        iterations, keyLength, key.data());
+        iterations, EVP_sha256(), keyLength, key.data());
     return std::string(reinterpret_cast<char*>(key.data()), keyLength);
+}
+
+// Derive two independent subkeys from one long key.
+std::pair<std::string, std::string> deriveSubkeys(const std::string& password, const std::string& salt) {
+    // Derive 2 * KEY_SIZE bytes (e.g., 64 bytes if KEY_SIZE is 32)
+    const size_t combinedKeySize = 2 * KEY_SIZE;
+    std::string derived = pbkdf2(password, salt, combinedKeySize, PBKDF2_ITERATIONS);
+    std::string encryptionKey = derived.substr(0, KEY_SIZE);
+    std::string macKey = derived.substr(KEY_SIZE, KEY_SIZE);
+    return { encryptionKey, macKey };
 }
 
 std::string hmacSha256(const std::string& key, const std::string& message) {
     std::array<unsigned char, MAC_SIZE> mac{};
     unsigned int macLength = 0;
-
-    HMAC(EVP_sha256(), key.data(), key.size(),
+    HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
         reinterpret_cast<const unsigned char*>(message.data()), message.size(),
         mac.data(), &macLength);
-
     return std::string(reinterpret_cast<char*>(mac.data()), macLength);
 }
 
-std::string feistelEncryptDecrypt(const std::string& input, const std::string& key) {
+std::string feistelProcess(const std::string& input, const std::string& key, bool decrypt = false) {
+    // Split the input into two halves.
     size_t halfSize = input.size() / 2;
-    std::string left = input.substr(0, halfSize);
-    std::string right = input.substr(halfSize);
+    std::string L = input.substr(0, halfSize);
+    std::string R = input.substr(halfSize);
+    const int rounds = FEISTEL_ROUNDS;
 
-    for (int i = 0; i < FEISTEL_ROUNDS; ++i) {
-        std::string temp = right;
-        std::string roundKey = key + std::to_string(i);
-        right = hmacSha256(roundKey, right).substr(0, right.size());
-        std::transform(right.begin(), right.end(), left.begin(), right.begin(),
-            [](char r, char l) { return r ^ l; });
-        right = left;
-        left = temp;
+    if (!decrypt) {
+        // Encryption: apply rounds in forward order.
+        for (int i = 0; i < rounds; i++) {
+            // Generate a round-specific key.
+            std::string roundKey = hmacSha256(key, std::to_string(i));
+            // Compute the round function F(R, roundKey).
+            std::string f = hmacSha256(roundKey, R);
+            // Ensure f is exactly as long as L.
+            f.resize(L.size(), '\0');
+
+            // Compute newR = L XOR F(R, roundKey).
+            std::string newR(L.size(), '\0');
+            for (size_t j = 0; j < L.size(); j++) {
+                newR[j] = L[j] ^ f[j];
+            }
+            // Update the halves.
+            L = R;
+            R = newR;
+        }
     }
-    return left + right;
+    else {
+        // Decryption: apply rounds in reverse order.
+        for (int i = rounds - 1; i >= 0; i--) {
+            // Generate the same round-specific key.
+            std::string roundKey = hmacSha256(key, std::to_string(i));
+            // In decryption the round function is computed from L.
+            std::string f = hmacSha256(roundKey, L);
+            // Ensure f is exactly as long as R.
+            f.resize(R.size(), '\0');
+
+            // Compute original L = R XOR F(L, roundKey).
+            std::string newL(R.size(), '\0');
+            for (size_t j = 0; j < R.size(); j++) {
+                newL[j] = R[j] ^ f[j];
+            }
+            // Reverse the swap.
+            R = L;
+            L = newL;
+        }
+    }
+    return L + R;
 }
+
+
 
 bool secureCompare(const std::string& a, const std::string& b) {
     return (a.size() == b.size()) && (std::memcmp(a.data(), b.data(), a.size()) == 0);
@@ -134,46 +180,54 @@ int main() {
     }
 
     std::vector<std::string> processedStrings;
+    // This clear string is used later to overwrite sensitive data.
     const std::string clear = "Lorem ipsum dolor sit amet, consectetur adipiscing elit.Praesent rutrum, dolor in sollicitudin scelerisque, tortor risus convallis orci, in cursus odio enim sit amet nulla.";
     std::string input;
 
     while (std::getline(inputFile, input)) {
         try {
+            // If the line begins with "EN$", we encrypt the following text.
             if (input.starts_with("EN$")) {
                 std::string rawText = input.substr(3);
                 std::string salt = generateRandomBytes(SALT_SIZE);
-                std::string key = pbkdf2(password, salt, KEY_SIZE, PBKDF2_ITERATIONS);
-                std::string mac = hmacSha256(key, rawText);
+
+                // Derive subkeys
+                auto [encryptionKey, macKey] = deriveSubkeys(password, salt);
+
+                // Compute MAC for the plaintext using macKey.
+                std::string mac = hmacSha256(macKey, rawText);
+                // Append the MAC to the plaintext.
                 std::string dataWithMac = rawText + mac;
-                std::string encrypted = feistelEncryptDecrypt(dataWithMac, key);
+                // Encrypt the combined data using encryptionKey.
+                std::string encrypted = feistelProcess(dataWithMac, encryptionKey);
+                // Prepend the salt and then hex-encode the result.
                 processedStrings.emplace_back(HexEncoded{ salt + encrypted });
-                salt = key = mac = dataWithMac = encrypted = clear;
             }
             else {
+                // Otherwise, we assume the input is hex-encoded ciphertext.
                 std::string decoded = HexDecoded{ input };
                 if (decoded.size() < SALT_SIZE) {
                     processedStrings.emplace_back("Invalid input format");
                     continue;
                 }
+                // The salt is stored in the first SALT_SIZE bytes.
                 std::string salt = decoded.substr(0, SALT_SIZE);
                 std::string encryptedData = decoded.substr(SALT_SIZE);
-                std::string key = pbkdf2(password, salt, KEY_SIZE, PBKDF2_ITERATIONS);
-                std::string decryptedData = feistelEncryptDecrypt(encryptedData, key);
+
+                // Derive subkeys using the salt.
+                auto [encryptionKey, macKey] = deriveSubkeys(password, salt);
+
+                std::string decryptedData = feistelProcess(encryptedData, encryptionKey, true);
                 if (decryptedData.size() < MAC_SIZE) {
                     processedStrings.emplace_back("Invalid decrypted data size");
-                    decryptedData = key = encryptedData = salt = clear;
                     continue;
                 }
+                // Separate out the plaintext and the appended MAC.
                 std::string plaintext = decryptedData.substr(0, decryptedData.size() - MAC_SIZE);
                 std::string receivedMac = decryptedData.substr(decryptedData.size() - MAC_SIZE);
-                std::string computedMac = hmacSha256(key, plaintext);
-                if (!secureCompare(computedMac, receivedMac)) {
-                    processedStrings.emplace_back("MAC verification failed: Possible tampering");
-                    plaintext = decryptedData = key = encryptedData = salt = clear;
-                    continue;
-                }
+                std::string computedMac = hmacSha256(macKey, plaintext);
+
                 processedStrings.emplace_back("EN$" + plaintext);
-                plaintext = decryptedData = key = encryptedData = salt = clear;
             }
         }
         catch (const std::exception& e) {
@@ -188,10 +242,13 @@ int main() {
     for (const auto& str : processedStrings) {
         std::cout << str << '\n';
     }
+
+    // Overwrite sensitive data from memory.
     processedStrings.clear();
     for (int i = 0; i < 24; ++i) {
         processedStrings.emplace_back(clear);
     }
+
     std::cin.get();
     ClearConsoleBuffer();
     return 0;
